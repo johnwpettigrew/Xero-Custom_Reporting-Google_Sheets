@@ -1,0 +1,659 @@
+// ===============================================
+// Xero ↔ Google Sheets Reporting
+// PUBLIC / TEMPLATE VERSION 
+// ===============================================
+//
+// Configure these via Script Properties or by replacing
+// the placeholder strings in a private copy of this file.
+// DO NOT commit real values to a public repo.
+// ===============================================
+
+// ====== GLOBAL CONFIG (PLACEHOLDERS) ======
+const CLIENT_ID       = 'YOUR_XERO_CLIENT_ID';
+const CLIENT_SECRET   = 'YOUR_XERO_CLIENT_SECRET';
+const REDIRECT_URI    = 'YOUR_APPS_SCRIPT_REDIRECT_URI';
+const TENANT_ID       = 'YOUR_XERO_TENANT_ID';
+const SPREADSHEET_ID  = 'YOUR_SPREADSHEET_ID';
+const SHEET_NAME      = 'Balance Sheet';
+const ERROR_EMAIL     = 'alerts@example.com'; // Optional: system error email
+const REPORT_EMAIL_TO = 'reports@example.com'; // For sending PDFs
+const TRACKING_CATEGORY_ID = 'YOUR_TRACKING_CATEGORY_ID'; // Xero tracking category ID
+
+// ====== UI SETUP ======
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Actions')
+    .addItem('Authorize', 'authorize')
+    .addItem('Fetch Balance Sheet Report', 'fetchBalanceSheetReport')
+    .addItem('Fetch Income Statement', 'fetchProfitAndLossReport')
+    .addItem('Email Reports', 'emailReports')
+    .addToUi();
+}
+
+// ====== OAUTH2 SETUP ======
+function getOAuthService() {
+  return OAuth2.createService('Xero')
+    .setAuthorizationBaseUrl('https://login.xero.com/identity/connect/authorize')
+    .setTokenUrl('https://identity.xero.com/connect/token')
+    .setClientId(CLIENT_ID)
+    .setClientSecret(CLIENT_SECRET)
+    .setCallbackFunction('authCallback')
+    .setPropertyStore(PropertiesService.getUserProperties())
+    .setScope('openid profile email accounting.reports.read offline_access accounting.settings.read')
+    .setRedirectUri(REDIRECT_URI)
+    .setParam('access_type', 'offline');
+}
+
+function authCallback(request) {
+  var service = getOAuthService();
+  var authorized = service.handleCallback(request);
+  if (authorized) {
+    return HtmlService.createHtmlOutput('Success. You can close this tab.');
+  } else {
+    Logger.log(service.getLastError());
+    return HtmlService.createHtmlOutput('Denied. You can close this tab.');
+  }
+}
+
+function authorize() {
+  var service = getOAuthService();
+  if (!service.hasAccess() || service.getLastError()) {
+    var authorizationUrl = service.getAuthorizationUrl();
+    SpreadsheetApp.getUi().showModalDialog(
+      HtmlService.createHtmlOutput(
+        'Authorize access to Xero at this ' +
+        '<a href="' + authorizationUrl + '" target="_blank">link</a>. Return here when done.'
+      ),
+      'Authorize Xero'
+    );
+  } else {
+    SpreadsheetApp.getUi().alert('You are already authorized.');
+  }
+}
+
+// Unified, non-private reauthorization notice
+function notifyReauthorizationRequired() {
+  var ui = SpreadsheetApp.getUi();
+  ui.alert(
+    'Authorization is required. ' +
+    'Please use the "Authorize" menu option to reauthorize access to Xero.'
+  );
+
+  // Optional: also send an email notification if ERROR_EMAIL is set
+  if (ERROR_EMAIL && ERROR_EMAIL !== '' && ERROR_EMAIL !== 'alerts@example.com') {
+    MailApp.sendEmail({
+      to: ERROR_EMAIL,
+      subject: 'Re-authorization Required for Xero Script',
+      body:
+        'The authorization for the Xero script has expired or is invalid.\n\n' +
+        'Please re-authorize the script by following these steps:\n' +
+        '1. Open the Google Sheet.\n' +
+        '2. Go to the "Actions" menu and select "Authorize".\n' +
+        '3. Follow the instructions to re-authorize the script.'
+    });
+  }
+}
+
+function sendErrorEmail(errorMessage) {
+  if (!ERROR_EMAIL || ERROR_EMAIL === 'alerts@example.com') {
+    Logger.log('Error (no ERROR_EMAIL configured): ' + errorMessage);
+    return;
+  }
+
+  MailApp.sendEmail({
+    to: ERROR_EMAIL,
+    subject: 'Error Notification in Google Sheets Script',
+    body: errorMessage
+  });
+}
+
+// ====== FETCH BALANCE SHEET REPORT ======
+function fetchBalanceSheetReport() {
+  var service = getOAuthService();
+  if (!service.hasAccess()) {
+    notifyReauthorizationRequired();
+    return;
+  }
+
+  try {
+    var today = new Date();
+    var dateString;
+
+    if (today.getDate() > 11) {
+      dateString = Utilities.formatDate(today, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    } else {
+      var lastDayOfLastMonth = new Date(today.getFullYear(), today.getMonth(), 0);
+      dateString = Utilities.formatDate(lastDayOfLastMonth, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    }
+
+    var url = 'https://api.xero.com/api.xro/2.0/Reports/BalanceSheet?date=' + dateString;
+    var response = UrlFetchApp.fetch(url, {
+      method: 'get',
+      headers: {
+        Authorization: 'Bearer ' + service.getAccessToken(),
+        'Xero-tenant-id': TENANT_ID,
+        Accept: 'application/json'
+      },
+      muteHttpExceptions: true
+    });
+
+    var data = JSON.parse(response.getContentText());
+
+    if (response.getResponseCode() === 200) {
+      writeToSheet(data, dateString);
+    } else {
+      var errorMsg = 'Error fetching data: ' + response.getContentText();
+      Logger.log(errorMsg);
+      sendErrorEmail(errorMsg);
+    }
+  } catch (error) {
+    Logger.log('An error occurred: ' + error.message);
+    sendErrorEmail('Error in fetchBalanceSheetReport: ' + error.message);
+  }
+}
+
+// Write Balance Sheet data to the Google Sheet
+function writeToSheet(data, asOfDateString) {
+  var sheet =
+    SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME) ||
+    SpreadsheetApp.getActiveSpreadsheet().insertSheet(SHEET_NAME);
+
+  sheet.clear(); // Clear existing data before writing anything
+
+  if (!data.Reports || data.Reports.length === 0) {
+    Logger.log('No reports found in the provided data.');
+    sendErrorEmail('No reports found in the provided data for Balance Sheet.');
+    return;
+  }
+
+  var report = data.Reports[0]; // First report
+  var rowData = [];
+
+  // Header
+  rowData.push(['Balance Sheet', report.ReportName, 'As of ' + asOfDateString]);
+  rowData.push([]); // Spacing row
+
+  report.Rows.forEach(function (section) {
+    if (section.RowType === 'Section' && section.Title) {
+      rowData.push([section.Title]); // e.g. "Assets"
+      (section.Rows || []).forEach(function (entry) {
+        if (entry.RowType === 'Row' || entry.RowType === 'SummaryRow') {
+          var row = [];
+          (entry.Cells || []).forEach(function (cell) {
+            row.push(cell.Value || '');
+          });
+          if (row.length > 0) {
+            rowData.push(row);
+          }
+        }
+      });
+      rowData.push([]); // Spacing row
+    }
+  });
+
+  // Write data to the sheet starting from row 1
+  rowData.forEach(function (row, index) {
+    if (row.length > 0) {
+      var range = sheet.getRange(index + 1, 1, 1, row.length);
+      range.setValues([row]);
+    }
+  });
+
+  if (rowData.length <= 2) {
+    sendErrorEmail('No new data written to Balance Sheet report.');
+  }
+}
+
+// ====== FETCH PROFIT & LOSS REPORTS ======
+function fetchProfitAndLossReport() {
+  var service = getOAuthService();
+  if (!service.hasAccess()) {
+    Logger.log('Access not authorized or token expired. Attempting to refresh token.');
+    // NOTE: getRefreshToken() is assumed to exist elsewhere in your project.
+    // Keep this call if you have implemented it; otherwise remove or replace it.
+    if (typeof getRefreshToken === 'function') {
+      getRefreshToken();
+    }
+
+    if (!service.hasAccess()) {
+      notifyReauthorizationRequired();
+      return;
+    }
+  }
+
+  var today = new Date();
+  var dayOfMonth = today.getDate();
+  var dateRanges;
+
+  if (dayOfMonth >= 1 && dayOfMonth <= 11) {
+    dateRanges = [
+      {
+        // Last month
+        fromDate: Utilities.formatDate(
+          new Date(today.getFullYear(), today.getMonth() - 1, 1),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        toDate: Utilities.formatDate(
+          new Date(today.getFullYear(), today.getMonth(), 0),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        sheetName: 'P&L_ALL_LAST_MONTH'
+      },
+      {
+        // Year to date
+        fromDate: Utilities.formatDate(
+          new Date(today.getFullYear(), 0, 1),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        toDate: Utilities.formatDate(
+          new Date(today.getFullYear(), today.getMonth(), 0),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        sheetName: 'P&L_ALL_YTD'
+      },
+      {
+        // Last month last year
+        fromDate: Utilities.formatDate(
+          new Date(today.getFullYear() - 1, today.getMonth() - 1, 1),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        toDate: Utilities.formatDate(
+          new Date(today.getFullYear() - 1, today.getMonth(), 0),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        sheetName: 'P&L_ALL_LAST_MONTH_LAST_YEAR'
+      },
+      {
+        // Last year to last month
+        fromDate: Utilities.formatDate(
+          new Date(today.getFullYear() - 1, 0, 1),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        toDate: Utilities.formatDate(
+          new Date(today.getFullYear() - 1, today.getMonth(), 0),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        sheetName: 'P&L_ALL_LAST_YTD'
+      }
+    ];
+  } else {
+    dateRanges = [
+      {
+        // Full current month
+        fromDate: Utilities.formatDate(
+          new Date(today.getFullYear(), today.getMonth(), 1),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        toDate: Utilities.formatDate(
+          new Date(today.getFullYear(), today.getMonth() + 1, 0),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        sheetName: 'P&L_ALL_LAST_MONTH'
+      },
+      {
+        // Year to today
+        fromDate: Utilities.formatDate(
+          new Date(today.getFullYear(), 0, 1),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        toDate: Utilities.formatDate(today, Session.getScriptTimeZone(), 'yyyy-MM-dd'),
+        sheetName: 'P&L_ALL_YTD'
+      },
+      {
+        // Full current month last year
+        fromDate: Utilities.formatDate(
+          new Date(today.getFullYear() - 1, today.getMonth(), 1),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        toDate: Utilities.formatDate(
+          new Date(today.getFullYear() - 1, today.getMonth() + 1, 0),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        sheetName: 'P&L_ALL_LAST_MONTH_LAST_YEAR'
+      },
+      {
+        // Last year to today last year
+        fromDate: Utilities.formatDate(
+          new Date(today.getFullYear() - 1, 0, 1),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        toDate: Utilities.formatDate(
+          new Date(today.getFullYear() - 1, today.getMonth(), today.getDate()),
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        ),
+        sheetName: 'P&L_ALL_LAST_YTD'
+      }
+    ];
+  }
+
+  for (var range of dateRanges) {
+    fetchAndWriteData(service, range.fromDate, range.toDate, range.sheetName);
+  }
+}
+
+function fetchAndWriteData(service, fromDate, toDate, sheetName) {
+  try {
+    var url =
+      'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?' +
+      'fromDate=' + fromDate +
+      '&toDate=' + toDate +
+      '&timeframe=MONTH' +
+      '&trackingCategoryID=' + encodeURIComponent(TRACKING_CATEGORY_ID);
+
+    var headers = {
+      Authorization: 'Bearer ' + service.getAccessToken(),
+      'Xero-tenant-id': TENANT_ID,
+      Accept: 'application/json'
+    };
+    var options = {
+      headers: headers,
+      method: 'get',
+      muteHttpExceptions: true
+    };
+
+    var response = UrlFetchApp.fetch(url, options);
+    if (response.getResponseCode() === 200) {
+      var data = JSON.parse(response.getContentText());
+      writeToSheetPnL(data, sheetName);
+    } else {
+      var errorMsg = 'Error fetching data: ' + response.getContentText();
+      Logger.log(errorMsg);
+      SpreadsheetApp.getUi().alert('Failed to fetch the report. Please check the error log.');
+      sendErrorEmail('Failed to fetch report for ' + sheetName + ': ' + errorMsg);
+    }
+  } catch (error) {
+    Logger.log('An error occurred while fetching data: ' + error.message);
+    sendErrorEmail('System error occurred in fetchAndWriteData for ' + sheetName + ': ' + error.message);
+  }
+}
+
+function writeToSheetPnL(data, sheetName) {
+  var spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  var sheet = spreadsheet.getSheetByName(sheetName) || spreadsheet.insertSheet(sheetName);
+  sheet.clear(); // Clear existing data before writing new data
+
+  if (!data || !data.Reports || !data.Reports[0].Rows) {
+    Logger.log('No usable data found in API response.');
+    sendErrorEmail('No usable data found in API response for Profit and Loss report.');
+    return;
+  }
+
+  var rows = data.Reports[0].Rows;
+  var allRows = [];
+
+  rows.forEach(function (row) {
+    if (row.RowType === 'Header') {
+      var headerValues = row.Cells.map(function (cell) { return cell.Value || ''; });
+      allRows.push(headerValues);
+    } else if (row.RowType === 'Section' && row.Rows) {
+      row.Rows.forEach(function (subRow) {
+        if (subRow.RowType === 'Row' || subRow.RowType === 'SummaryRow') {
+          var rowValues = subRow.Cells.map(function (cell) { return cell.Value || ''; });
+          allRows.push(rowValues);
+        }
+      });
+    }
+  });
+
+  if (allRows.length > 0) {
+    var range = sheet.getRange(1, 1, allRows.length, allRows[0].length);
+    range.setValues(allRows);
+  }
+
+  if (data.Reports[0].ReportTitles && data.Reports[0].ReportTitles.length > 0) {
+    var title = data.Reports[0].ReportTitles[data.Reports[0].ReportTitles.length - 1];
+    sheet.getRange('A1').setValue(title);
+  }
+
+  if (allRows.length === 0) {
+    sendErrorEmail('No new data written to Profit and Loss report.');
+  }
+}
+
+// ====== EMAIL REPORTS AS PDFs ======
+function emailReports() {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var emailAddress = REPORT_EMAIL_TO;
+
+  var checkSheet = spreadsheet.getSheetByName('CHECK');
+  var sendCondition = checkSheet ? checkSheet.getRange('B18').getValue() : 'NO';
+
+  // Map "print" sheet name → report title for PDF filename
+  var sheetToPdf = {
+    'Balance Sheet Formated': 'Balance Sheet',
+    'Income Statement All Units (Consolidated)': 'Income Statement All Units (Consolidated)',
+    'Income Statement (Without Executives)': 'Income Statement (Without Executives)',
+    '02 Location': 'Income Statement Location 02',
+    '03 Location': 'Income Statement Location 03',
+    '05 Location': 'Income Statement Location 05',
+    '06 Location': 'Income Statement Location 06',
+    '08 Location': 'Income Statement Location 08',
+    '10 Location': 'Income Statement Location 10',
+    '11 Location': 'Income Statement Location 11',
+    '12 Location': 'Income Statement Location 12',
+    '14 Location': 'Income Statement Location 14',
+    '19 Location': 'Income Statement Location 19',
+    '25 Location': 'Income Statement Location 25',
+    'Income Statement Executive (Executive 1)': 'Income Statement Executive (Executive 1)',
+    'Income Statement Executive (Executive 2)': 'Income Statement Executive (Executive 2)',
+    'Income Statement Executive (Executive 3)': 'Income Statement Executive (Executive 3)'
+  };
+
+  var today = new Date();
+  var dateString = Utilities.formatDate(today, Session.getScriptTimeZone(), 'dd MMM yy');
+
+  var mergePdf1Files = [
+    'Income Statement (Without Executives)',
+    '02 Location',
+    '03 Location',
+    '05 Location',
+    '06 Location',
+    '08 Location',
+    '10 Location',
+    '11 Location',
+    '12 Location',
+    '14 Location',
+    '19 Location',
+    '25 Location'
+  ];
+
+  var mergePdf2Files = [
+    'Income Statement Executive (Executive 1)',
+    'Income Statement Executive (Executive 2)',
+    'Income Statement Executive (Executive 3)'
+  ];
+
+  var pdfBlobs1 = mergePdf1Files.map(function (sheetName) {
+    return fetchPDFWithRetry(sheetName, sheetToPdf[sheetName]);
+  });
+  var pdfBlobs2 = mergePdf2Files.map(function (sheetName) {
+    return fetchPDFWithRetry(sheetName, sheetToPdf[sheetName]);
+  });
+
+  Promise.all([
+    mergePDFsUsingPDFApp(pdfBlobs1),
+    mergePDFsUsingPDFApp(pdfBlobs2)
+  ]).then(function (results) {
+    results[0].setName('Income Statement (Without Executives).pdf');
+    results[1].setName('Income Statement Executives.pdf');
+
+    var singlePagePdf1 = fetchPDFWithRetry('Balance Sheet Formated', 'Balance Sheet.pdf');
+    var singlePagePdf2 = fetchPDFWithRetry(
+      'Income Statement All Units (Consolidated)',
+      'Income Statement All Units (Consolidated).pdf'
+    );
+
+    var attachments = [
+      results[0],
+      results[1],
+      singlePagePdf1,
+      singlePagePdf2
+    ];
+
+    if (sendCondition === 'YES') {
+      MailApp.sendEmail({
+        to: emailAddress,
+        subject: 'Financial Reports - ' + dateString,
+        body: 'Please find attached the financial reports.',
+        attachments: attachments
+      });
+
+      SpreadsheetApp.getUi().alert('Email sent successfully.');
+    } else {
+      SpreadsheetApp.getUi().alert('Send condition not met. Email not sent.');
+    }
+  }).catch(function (error) {
+    Logger.log('Error: ' + error.message);
+    sendErrorEmail('Error in emailReports: ' + error.message);
+  });
+}
+
+function fetchPDFWithRetry(sheetName, pdfName, maxRetries) {
+  maxRetries = maxRetries || 5;
+  var attempts = 0;
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) {
+    throw new Error(sheetName + ' sheet not found.');
+  }
+
+  var url = spreadsheet.getUrl().replace(/edit$/, '') + 'export?';
+  var params = {
+    exportFormat: 'pdf',
+    format: 'pdf',
+    size: 'letter',
+    portrait: 'false',
+    fitw: 'true',
+    scale: '4',
+    sheetnames: 'false',
+    printtitle: 'false',
+    pagenumbers: 'false',
+    gridlines: 'false',
+    fzr: 'false',
+    gid: sheet.getSheetId()
+  };
+  url += Object.keys(params)
+    .map(function (key) {
+      return key + '=' + encodeURIComponent(params[key]);
+    })
+    .join('&');
+
+  var options = {
+    method: 'get',
+    headers: {
+      Authorization: 'Bearer ' + ScriptApp.getOAuthToken()
+    },
+    muteHttpExceptions: true
+  };
+
+  while (attempts < maxRetries) {
+    try {
+      var response = UrlFetchApp.fetch(url, options);
+      if (response.getResponseCode() === 200) {
+        return response.getBlob().setName(pdfName);
+      }
+    } catch (e) {
+      if (e.toString().indexOf('429') > -1) {
+        var waitTime = Math.pow(2, attempts) * 1000;
+        Utilities.sleep(waitTime);
+        attempts++;
+      } else {
+        throw e;
+      }
+    }
+  }
+  throw new Error('Failed to fetch PDF after ' + maxRetries + ' attempts for ' + sheetName);
+}
+
+function mergePDFsUsingPDFApp(pdfBlobs) {
+  var app = new PDFApp({});
+  return app.mergePDFs(pdfBlobs)
+    .then(function (newBlob) {
+      newBlob.setName('merged.pdf');
+      return newBlob;
+    })
+    .catch(function (err) {
+      throw new Error('Error merging PDFs: ' + err.message);
+    });
+}
+
+// ====== PDF MERGE HELPER (PDF-LIB) ======
+class PDFApp {
+  constructor(e) {
+    this.cdnjs = 'https://cdn.jsdelivr.net/npm/pdf-lib/dist/pdf-lib.min.js';
+    this.cdnFontkit = 'https://unpkg.com/@pdf-lib/fontkit/dist/fontkit.umd.min.js';
+    this.loadPdfLib_();
+    if (e.useCustomFont && e.useCustomFont.toString() === 'Blob') {
+      this.loadFontkit_();
+      this.customFont = e.useCustomFont;
+    } else if (e.useStandardFont && typeof e.useStandardFont === 'string') {
+      this.standardFont = e.useStandardFont;
+    }
+  }
+
+  loadPdfLib_() {
+    this.loadJavascriptLibrary_(
+      UrlFetchApp.fetch(this.cdnjs)
+        .getContentText()
+        .replace(/setTimeout\(.*?,.*?(\d*?)\)/g, 'Utilities.sleep($1);return t();')
+    );
+  }
+
+  loadFontkit_() {
+    this.loadJavascriptLibrary_(
+      UrlFetchApp.fetch(this.cdnFontkit).getContentText()
+    );
+  }
+
+  loadJavascriptLibrary_(jsLib) {
+    // eslint-disable-next-line no-eval
+    eval(jsLib);
+  }
+
+  async getPDFObjectFromBlob_(blob) {
+    return await this.PDFLib.PDFDocument.load(new Uint8Array(blob.getBytes()));
+  }
+
+  mergePDFs(pdfBlobs) {
+    var self = this;
+    return new Promise(async function (resolve, reject) {
+      try {
+        var data = pdfBlobs.map(function (blob) {
+          return new Uint8Array(blob.getBytes());
+        });
+        var pdfDoc = await self.PDFLib.PDFDocument.create();
+        for (var i = 0; i < data.length; i++) {
+          var pdfData = await self.PDFLib.PDFDocument.load(data[i]);
+          var pages = await pdfDoc.copyPages(pdfData, pdfData.getPageIndices());
+          pages.forEach(function (page) {
+            pdfDoc.addPage(page);
+          });
+        }
+        var bytes = await pdfDoc.save();
+        var newBlob = Utilities.newBlob(
+          [].slice.call(new Int8Array(bytes)),
+          MimeType.PDF,
+          'new_PDFFile.pdf'
+        );
+        resolve(newBlob);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+}
